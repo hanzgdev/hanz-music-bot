@@ -1,156 +1,180 @@
+import asyncio
+import logging
 import os
+import tempfile
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, Router, types
+from aiogram.filters import CommandStart, Command
+from aiogram.types import FSInputFile, Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-TOKEN = os.environ.get('TOKEN')
+# -------------------------------
+# CONFIG
+# -------------------------------
 
-search_results = {}
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Set this in Railway Variables
+YOUTUBE_COOKIES_VAR = "YOUTUBE_COOKIES"  # env var name you used
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎵 *Hanz Music Downloader*\n\n"
-        "Just send me a song title and I'll find it for you!\n\n"
-        "Example: `never gonna give you up`",
-        parse_mode='Markdown'
-    )
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.message.text.strip()
-    if not query:
-        await update.message.reply_text("Please send a song name or title!")
-        return
+# Router
+router = Router()
 
-    user_id = update.effective_user.id
-    msg = await update.message.reply_text(f"🔍 Searching for *{query}*...", parse_mode='Markdown')
+# States (optional - can remove if you don't need multi-step)
+class DownloadForm(StatesGroup):
+    waiting_for_query = State()
 
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'extract_flat': True,
-            'noplaylist': True,
-        }
+# -------------------------------
+# YT-DLP OPTIONS
+# -------------------------------
+def get_ydl_opts(cookie_path: str | None = None) -> dict:
+    opts = {
+        'format': 'bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',  # or 128, 320 etc.
+        }],
+        'outtmpl': '%(title)s.%(ext)s',  # temp file name
+        'quiet': True,
+        'no_warnings': True,
+        'continuedl': True,
+        'retries': 10,
+        'fragment_retries': 10,
+        # Optional anti-detection
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'referer': 'https://www.youtube.com/',
+    }
+    
+    if cookie_path:
+        opts['cookiefile'] = cookie_path
+    
+    return opts
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Changed to YouTube search — much more reliable for full songs
-            results = ydl.extract_info(f"ytsearch5:{query}", download=False)
-            entries = results.get('entries', [])
-
-        if not entries:
-            await msg.edit_text("❌ No results found. Try a different song!")
-            return
-
-        # Keep only first 5 results
-        search_results[user_id] = entries[:5]
-
-        keyboard = []
-        text = "🎵 *Top 5 Results:*\n\n"
-        for i, entry in enumerate(entries[:5]):
-            title = entry.get('title', 'Unknown title')
-            duration = entry.get('duration') or 0
-            mins = int(duration // 60)
-            secs = int(duration % 60)
-            duration_str = f"{mins}:{secs:02d}" if duration else "??:??"
-            text += f"`{i+1}.` {title} ({duration_str})\n"
-            # Shorten button text if title is very long
-            btn_text = f"{i+1}. {title[:38]}" + ("..." if len(title) > 38 else "")
-            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"dl_{user_id}_{i}")])
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await msg.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-    except Exception as e:
-        print(f"SEARCH ERROR: {type(e).__name__}: {e}")
-        await msg.edit_text("❌ Something went wrong while searching. Try again!")
-
-async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    try:
-        _, user_id_str, index_str = query.data.split('_')
-        user_id = int(user_id_str)
-        index = int(index_str)
-    except:
-        await query.edit_message_text("❌ Invalid selection. Try searching again.")
-        return
-
-    if user_id not in search_results or index >= len(search_results[user_id]):
-        await query.edit_message_text("❌ Session expired or invalid choice. Please search again!")
-        return
-
-    entry = search_results[user_id][index]
-    url = entry.get('url') or entry.get('webpage_url') or entry.get('id')
-    title = entry.get('title', 'track').replace('/', '_').replace('\\', '_')  # safe filename
-
-    await query.edit_message_text(f"⬇️ Downloading *{title}*...", parse_mode='Markdown')
-
-    try:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': f'/tmp/{user_id}_%(title)s.%(ext)s',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'quiet': True,
-            'no_warnings': True,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # Try to get the exact output filename
-            filepath = ydl.prepare_filename(info)
-            if not filepath.endswith('.mp3'):
-                filepath = filepath.rsplit('.', 1)[0] + '.mp3'
-
-        if not os.path.exists(filepath):
-            raise FileNotFoundError("Audio file was not created")
-
-        await query.edit_message_text(f"📤 Uploading *{title}*...", parse_mode='Markdown')
-
-        with open(filepath, 'rb') as audio_file:
-            await context.bot.send_audio(
-                chat_id=query.message.chat_id,
-                audio=audio_file,
-                title=title,
-                performer="Hanz Music Bot",
-                duration=entry.get('duration'),
-                thumbnail=None,  # optional: can add later if you want
-            )
-
-        # Cleanup
+# -------------------------------
+# HELPERS
+# -------------------------------
+async def download_audio(query: str) -> tuple[Path | None, str | None]:
+    ydl_opts = get_ydl_opts()
+    
+    # Load cookies from env if available
+    cookies_content = os.environ.get(YOUTUBE_COOKIES_VAR)
+    cookie_path = None
+    
+    if cookies_content:
         try:
-            os.remove(filepath)
-        except:
-            pass
-
-        await query.delete_message()
-
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_file:
+                temp_file.write(cookies_content)
+                cookie_path = temp_file.name
+            ydl_opts['cookiefile'] = cookie_path
+            logger.info(f"Using cookies from env var → {cookie_path}")
+        except Exception as e:
+            logger.error(f"Failed to write cookies: {e}")
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Search first (ytsearch: returns best match)
+            info = ydl.extract_info(f"ytsearch:{query}", download=False)
+            if 'entries' not in info or not info['entries']:
+                return None, "No results found for this query."
+            
+            video_info = info['entries'][0]
+            video_url = video_info['url']
+            title = video_info.get('title', 'Unknown Title')
+            
+            # Now download the best audio
+            logger.info(f"Downloading: {title}")
+            ydl.download([video_url])
+            
+            # Find the downloaded file (yt-dlp renames to title.mp3 usually)
+            possible_files = list(Path(".").glob(f"{title}*.mp3")) + list(Path(".").glob("*.mp3"))
+            if not possible_files:
+                return None, "Downloaded but could not find the mp3 file."
+            
+            file_path = possible_files[0]
+            return file_path, None
+    
     except Exception as e:
-        print(f"DOWNLOAD ERROR for '{title}': {type(e).__name__}: {str(e)}")
-        await query.edit_message_text(
-            f"❌ Download failed: {str(e)[:120]}\nTry another track!",
-            parse_mode=None
-        )
+        logger.error(f"yt-dlp error: {str(e)}", exc_info=True)
+        return None, f"Download failed: {str(e)}"
+    
+    finally:
+        # Clean up temp cookie file
+        if cookie_path and os.path.exists(cookie_path):
+            try:
+                os.unlink(cookie_path)
+            except:
+                pass
 
-def main():
-    if not TOKEN:
-        print("ERROR: TOKEN environment variable is not set!")
-        return
-
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
-    app.add_handler(CallbackQueryHandler(download, pattern=r'^dl_'))
-
-    print("Bot is starting...")
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
+# -------------------------------
+# HANDLERS
+# -------------------------------
+@router.message(CommandStart())
+async def start_handler(message: Message):
+    await message.answer(
+        "🎵 **Hanz Music Downloader**\n\n"
+        "Just send me a song title and I'll find & download it for you!\n\n"
+        "Example: Blinding Lights\n"
+        "Or: never gonna give you up"
     )
 
-if __name__ == '__main__':
-    main()
+@router.message(\~Command())  # any non-command text message
+async def search_and_download(message: Message):
+    query = message.text.strip()
+    if not query:
+        await message.answer("Please send a song title!")
+        return
+    
+    loading_msg = await message.answer("🔍 Searching and downloading... Please wait (can take 10–60 seconds)...")
+    
+    file_path, error = await download_audio(query)
+    
+    if error:
+        await loading_msg.edit_text(
+            f"❌ Download failed: ERROR:\n{error}\n\nTry another track!"
+        )
+        return
+    
+    try:
+        # Send audio
+        audio_file = FSInputFile(file_path)
+        await message.answer_audio(
+            audio=audio_file,
+            title=file_path.stem,
+            caption=f"🎧 {file_path.stem}\nDownloaded via HanZ Music Bot"
+        )
+        
+        await loading_msg.delete()  # remove "please wait" message
+    except Exception as e:
+        await loading_msg.edit_text(f"Failed to send audio: {str(e)}")
+    finally:
+        # Clean up downloaded file
+        if file_path and file_path.exists():
+            try:
+                os.unlink(file_path)
+            except:
+                pass
+
+# -------------------------------
+# MAIN
+# -------------------------------
+async def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not set in environment variables!")
+        return
+    
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    
+    logger.info("Bot is starting...")
+    await dp.start_polling(bot, allowed_updates=types.default_allowed_updates)
+
+if __name__ == "__main__":
+    asyncio.run(main())
