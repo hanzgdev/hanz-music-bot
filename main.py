@@ -23,7 +23,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ydl_opts = {
             'quiet': True,
             'extract_flat': True,
-            'default_search': 'scsearch5',
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -50,7 +49,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
     except Exception as e:
-        await msg.edit_text(f"❌ Something went wrong. Try again!")
+        await msg.edit_text("❌ Something went wrong. Try again!")
 
 async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -108,7 +107,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
     app.add_handler(CallbackQueryHandler(download, pattern=r'^dl_'))
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
